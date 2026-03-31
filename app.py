@@ -7,6 +7,7 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 from operator import itemgetter
+from sqlalchemy import create_engine
 
 # --- 1. Page Config ---
 st.set_page_config(page_title="Inventory AI Engineer", page_icon="📊", layout="wide")
@@ -21,12 +22,22 @@ except KeyError:
     st.error("Missing Secrets! Add SUPABASE_URL and GOOGLE_API_KEY to your Streamlit secrets.")
     st.stop()
 
+# --- Fix: Replace deprecated 'postgres://' with 'postgresql://' for SQLAlchemy 2.x ---
+if db_uri.startswith("postgres://"):
+    db_uri = db_uri.replace("postgres://", "postgresql://", 1)
+
 # --- 3. Initialize Chain + Extract Schema ---
 @st.cache_resource
 def get_chain_and_schema():
-    db = SQLDatabase.from_uri(db_uri)
+    engine = create_engine(
+        db_uri,
+        connect_args={
+            "sslmode": "require",
+            "connect_timeout": 10,
+        }
+    )
+    db = SQLDatabase(engine)
 
-    # Extract schema: {table_name: [col1, col2, ...]}
     schema = {}
     for table in db.get_usable_table_names():
         try:
@@ -76,79 +87,96 @@ def get_chain_and_schema():
 
 chain, schema = get_chain_and_schema()
 
-# --- 4. Sidebar: Schema Browser ---
-with st.sidebar:
-    st.header("🗂️ Database Schema")
-    st.caption("Browse all tables and their columns.")
+# --- 4. Build flat list of all tables + columns for suggestions ---
+all_suggestions = []
+for table, cols in schema.items():
+    all_suggestions.append(f"[TABLE] {table}")
+    for col in cols:
+        all_suggestions.append(f"[COL] {table}.{col}")
 
-    if schema:
-        for table, cols in schema.items():
-            with st.expander(f"📋 {table}", expanded=False):
-                if cols:
-                    for col in cols:
-                        st.code(col, language=None)
-                else:
-                    st.caption("No columns found.")
+# --- 5. Layout: Left = Schema + Suggestions | Right = Chat ---
+left_col, right_col = st.columns([1, 2], gap="large")
+
+with left_col:
+    st.subheader("🗂️ Schema Browser")
+
+    search = st.text_input(
+        "Search tables & columns",
+        placeholder="🔍 Type to filter...",
+        key="schema_search"
+    )
+
+    if search:
+        filtered = [s for s in all_suggestions if search.lower() in s.lower()]
     else:
-        st.info("No tables found in the database.")
+        filtered = all_suggestions
 
-# --- 5. Live Suggestion Filter ---
-st.subheader("💡 Schema Suggestions")
+    if filtered:
+        tables_found = [s for s in filtered if s.startswith("[TABLE]")]
+        cols_found   = [s for s in filtered if s.startswith("[COL]")]
 
-all_names = list(schema.keys())
-for cols in schema.values():
-    all_names.extend(cols)
-all_names = sorted(set(all_names))
+        if tables_found:
+            st.markdown("**📋 Tables**")
+            for t in tables_found:
+                name = t.replace("[TABLE] ", "")
+                st.code(name, language=None)
 
-search_term = st.text_input(
-    "Filter tables/columns",
-    placeholder="🔍 Start typing a table or column name...",
-    label_visibility="collapsed"
-)
-
-if search_term:
-    matches = [n for n in all_names if search_term.lower() in n.lower()]
-    if matches:
-        st.markdown("**Matching tables / columns:**")
-        cols_per_row = 4
-        rows = [matches[i:i+cols_per_row] for i in range(0, len(matches), cols_per_row)]
-        for row in rows:
-            grid = st.columns(cols_per_row)
-            for idx, name in enumerate(row):
-                tag = "🟦" if name in schema else "🔹"
-                grid[idx].code(f"{tag} {name}", language=None)
-        st.caption("🟦 = table &nbsp;&nbsp; 🔹 = column")
+        if cols_found:
+            st.markdown("**🔹 Columns**")
+            for c in cols_found:
+                label = c.replace("[COL] ", "")
+                st.code(label, language=None)
     else:
         st.info("No matches found.")
-else:
-    st.markdown("**All tables (quick reference):**")
-    if schema:
-        cols_ui = st.columns(min(len(schema), 5))
-        for i, table in enumerate(schema.keys()):
-            cols_ui[i % len(cols_ui)].code(table, language=None)
 
-st.markdown("---")
+    st.markdown("---")
 
-# --- 6. Chat Interface ---
-st.subheader("💬 Ask a Question")
+    st.subheader("✨ Quick Insert")
+    st.caption("Pick a table/column to insert into your question below.")
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+    options = ["(none)"] + [
+        s.replace("[TABLE] ", "").replace("[COL] ", "") for s in all_suggestions
+    ]
+    selected = st.selectbox("Insert into question:", options, key="quick_insert")
 
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+    if selected != "(none)":
+        st.session_state["inserted_term"] = selected
 
-if prompt := st.chat_input("e.g. How many products are low on stock?"):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+with right_col:
+    st.subheader("💬 Ask a Question")
 
-    with st.chat_message("assistant"):
-        with st.spinner("Analyzing database..."):
+    prefill = st.session_state.get("inserted_term", "")
+
+    user_question = st.text_area(
+        "Your question",
+        value=prefill,
+        placeholder="e.g. Show me all products where stock is below 10",
+        height=100,
+        label_visibility="collapsed",
+        key="question_input"
+    )
+
+    ask_btn = st.button("🚀 Ask", use_container_width=True, type="primary")
+
+    st.markdown("---")
+
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    if ask_btn and user_question.strip():
+        st.session_state["inserted_term"] = ""
+        st.session_state.messages.append({"role": "user", "content": user_question})
+
+        with st.spinner("🔍 Analyzing your database..."):
             try:
-                response = chain.invoke({"question": prompt})
-                st.markdown(response)
+                response = chain.invoke({"question": user_question})
                 st.session_state.messages.append({"role": "assistant", "content": response})
             except Exception as e:
-                st.error(f"Execution Error: {e}")
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": f"❌ Execution Error: {e}"
+                })
+
+    for message in reversed(st.session_state.messages):
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
