@@ -1,4 +1,4 @@
-📊 Smart Inventory Manager AI
+Smart Inventory Manager AI
 
 A Streamlit web app that allows you to interact with your inventory database using natural language.
 Powered by LangChain, Google's Gemini LLM, and Supabase PostgreSQL, it automatically generates SQL queries
